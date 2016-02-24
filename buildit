@@ -1,0 +1,282 @@
+#!/bin/bash
+# poor error handling (for now...)
+set -e
+
+IMAGE="armv7/armhf-ubuntu"
+#IMAGE="f2hex/armhf-ubuntu_core-with-devtools:latest"
+VOL_HOSTDIR=`pwd`
+VOL_MOUNTPOINT="/root/sd"
+VOL_HOSTROOT="/hostroot"
+MAINTAINER='franco.fiorese@gmail.com'
+
+IMG_BASENAME="motioneye"
+BASE_DIR="/root/sd"
+TARGET_TREE=$BASE_DIR/$IMG_BASENAME-docker-imgtree
+IMAGE_TREE=`pwd`/motioneye-docker-imgtree
+# URLs used to fetch PyRun and motioneye
+PYRUN_TARGZ="egenix-pyrun-2.1.1.tar.gz"
+PYRUN_TARGZ_URL="https://downloads.egenix.com/python/$PYRUN_TARGZ"
+MOTIONEYE_GIT="https://github.com/ccrisan/motioneye.git"
+
+# Flags to be passed during the build of native applications building
+# Platform/Architecture specific
+BUILD_CFLAGS="-march=native -mfloat-abi=hard -mfpu=neon -ftree-vectorize -mvectorize-with-neon-quad -ffast-math -mcpu=cortex-a9 -mtune=cortex-a9 -mthumb -O2 -pipe -fstack-protector --param=ssp-buffer-size=4"
+
+# Files and external commmands used by motioneye. These are the
+# mandatory ones and the list is obviously dependent on the specific
+# deployment of motioneye.  Each entry must conforms to a full
+# absolute pathspec. Files are grabbed from the host system.
+declare -a needed_files=(
+  "/bin/sh" 
+  "/bin/dash" 
+  "/bin/which" 
+  "/bin/tar" 
+  "/bin/cat" 
+  "/bin/which"
+  "/bin/grep"
+  "/bin/rm"
+  "/bin/mkdir" 
+  "/etc/mime.types" 
+);
+
+# This is the optional set of files and programs useful mostly for
+# testing the motioneye image. Each entry must conforms to a full
+# absolute pathspec. File are grabbed from the host system.
+declare -a optional_files=(
+  "/bin/sed" 
+  "/bin/ps"
+  "/bin/less"
+  "/bin/mkdir"
+  "/bin/cp"
+  "/bin/df"
+  "/bin/ls"
+  "/bin/bash"
+  "/bin/sh"
+  "/usr/bin/wget"
+  "/usr/bin/du"
+  "/usr/bin/tree"
+);
+
+# This is the list of dirs/files to be removed from the target tree of
+# the motioneye image.  Each entry must be conform to a full absolute
+# pathspec.
+
+declare -a remove_files=(
+  "/usr/bin/pyrun2.7-debug"
+  "/usr/include"
+  "/usr/lib/python2.7/site-packages/tornado/test"
+)
+
+all_progs=("${needed_files[@]}" "${optional_files[@]}")
+
+path_add() {
+    if [ -d "$1" ] && [[ ":$PATH:" != *":$1:"* ]]; then
+        PATH="${PATH:+"$PATH:"}$1"
+    fi
+}
+
+
+fcopy() {
+    # if destination path does not exists create it
+    if [ ! -d ${2%/*} ];then
+	mkdir -p ${2%/*}
+    fi
+    echo cp -pd $1 $2
+    cp -pd $1 $2
+}
+
+setup() {
+    case "$1" in
+	upgrade)
+              # upgrade image and install required packages for
+              # building up software components
+	      echo "deb http://ports.ubuntu.com/ trusty main restricted universe multiverse" >> /etc/apt/sources.list
+	      apt-get update && apt-get -y upgrade
+	      apt-get -y install \
+		  zile \
+		  less \
+		  git \
+		  wget \
+		  tree \
+		  mc \
+		  build-essential \
+		  autoconf \
+		  automake \
+		  pkgconf \
+		  libtool \
+		  libjpeg8-dev \
+		  libzip-dev \
+		  zlib1g-dev \
+		  libssl-dev \
+		  libsqlite3-dev \
+		  libghc-bzlib-dev \
+		  libcurl4-openssl-dev \
+		  libcurl3
+	      ;;
+
+        python_build)
+            # fetch the PyRun python distribution and build it for
+            # armhf architecture PyRun(TM) is the eGenix open source
+            # version of python optimized for size site:
+            # https://www.egenix.com/products/python/PyRun
+            cd $BASE_DIR
+  	    # download the pyrun sources from Egenix site
+	    if [ ! -f $PYRUN_TARGZ ]; then
+  		wget $PYRUN_TARGZ_URL
+	    fi
+  	    tar -xvz -f $PYRUN_TARGZ
+  	    cd egenix-pyrun-*
+  	    cd PyRun
+  	    # add extra optimization flags for compilation (this is specific for ARM Cortex A9)
+  	    export CFLAGS=$BUILD_CFLAGS 
+  	    # build the python distribution and create a tar binary archive of
+  	    # it
+  	    make distribution
+	    ;;
+
+        python_install)
+            cd $BASE_DIR
+  	    cd egenix-pyrun-*
+  	    cd PyRun
+	    # remove the current distribution if any
+	    if [ -d $TARGET_TREE ]; then
+		rm -rf $TARGET_TREE
+	    fi
+  	    # install the PyRun distribution in the target tree
+  	    ./install-pyrun --platform=armv7l --pyrun-distribution=./dist/egenix-pyrun--py2.7_ucs2-.tgz $TARGET_TREE/usr
+	    echo "python distribion install completed - target: $TARGET_TREE/usr"
+            ;;
+
+        deps_install)
+  	    cd $BASE_DIR
+	    path_add $TARGET_TREE/usr/bin
+  	    # install the additional python packages required by motioneye
+  	    pip install jinja2 tornado pillow pycurl
+  	    # remove doc files
+  	    rm -rf $TARGET_TREE/usr/share
+	    ;;
+
+        motioneye_install)
+  	    cd $BASE_DIR
+	    path_add $TARGET_TREE/usr/bin
+  	    # install motioneye
+  	    pip install motioneye
+  	    # remove doc files
+  	    rm -rf $TARGET_TREE/usr/share
+            ;;
+
+        systools_install)
+  	    cd $BASE_DIR
+	    for file in ${all_progs[@]}
+	    do
+
+		if [ ! -f $TARGET_TREE$file ];then
+		    if [  -L $file ];then
+			fsource=`readlink -f $file`
+			#fcopy $fsource $TARGET_TREE${fsource#${VOL_HOSTROOT}}
+			fcopy $fsource $TARGET_TREE$fsource
+		    fi
+		    fcopy $file $TARGET_TREE$file
+		fi
+	    done
+            ;;
+
+        finalize)
+	    path_add $TARGET_TREE/usr/bin
+	    # compile all python files
+	    pyrun compileall.py -f $TARGET_TREE
+
+  	    cd $BASE_DIR
+   	     # fix the improper shebang in the executable ASCII files just installed
+  	    find $TARGET_TREE -type f -perm /u+x -exec ./fix-shebang $TARGET_TREE/usr/bin/pyrun '/usr/bin/python' '{}' \;
+
+            # scan all the executable files and check for any shell script requring a shell interpreter (either bash or sh)
+	    SH_SCRIPTS=`find $TARGET_TREE -type f -perm /u+x -exec file '{}' \; | grep 'POSIX shell script' | cut -d ':' -f1 `
+	    if [ ! -z "$SH_SCRIPTS" ];then
+		cp -pd /bin/sh  $TARGET_TREE/bin/
+	    fi
+	    BASH_SCRIPTS=`find $TARGET_TREE -type f -perm /u+x -exec file '{}' \; | grep 'Bourne-Again shell script' | cut -d ':' -f1 `
+	    if [ ! -z "$BASH_SCRIPTS" ];then
+		cp -pd /bin/bash  $TARGET_TREE/bin/
+	    fi
+
+	    # scan all the executable and shared libraries, in the
+	    # target tree and bring in the target tree the required
+	    # dependencies that were originally installed in the root file system
+	    DEPS_LIST=`find $TARGET_TREE -type f -perm /u+x -exec ldd  '{}' \; | sort | sed -r 's/\(\w+\)//g' | uniq | grep -v 'dynamic\|statically' | cut -d '>' -f2 | sed -e 's/^[ \t]*//'`
+	    echo "TARGET_TREE=$TARGET_TREE"
+	    echo "DEPS_LIST=$DEPS_LIST"
+	    for file in $DEPS_LIST
+	    do
+		if [ ! -f $TARGET_TREE$file ];then
+		    if [  -L $file ];then
+			fsource=`readlink -f $file`
+			fcopy $fsource $TARGET_TREE$fsource
+		    fi
+		    fcopy $file $TARGET_TREE$file
+		fi
+	    done
+
+	    for file in ${remove_files[@]}
+	    # remove specific files
+	    do
+		if [ -e $TARGET_TREE$file ];then
+		    echo "Removing $TARGET_TREE/$file"
+		    rm -rf $TARGET_TREE/$file
+		fi
+	    done
+	    
+	    # remove all python source files
+            find $TARGET_TREE -name "*.py" -exec rm -rf {} \;
+
+	    # remove debug info from executable files (ignore error in
+	    # case of executing strip on non-exec files)
+	    find $TARGET_TREE -type f -perm /u+x | xargs strip || true
+
+            # finally generate a tree (ASCII) representation of the image
+	    tree -p $TARGET_TREE > $TARGET_TREE/image-tree.txt
+	   ;;
+
+        *)
+           ;;
+    esac
+}
+
+
+case "$1" in
+    _setup-all)
+        # prepare the Container filesystem content through the following steps
+	setup upgrade
+        setup python_build
+        setup python_install
+	setup deps_install
+	setup motioneye_install
+	setup systools_install
+	setup finalize
+	;;
+
+    _build-content)
+	# run the software stack build and setup inside a Container
+	# (Container is not retained)
+        # Access to host root is required in order to copy the needed files
+	docker run -i -t --rm -v /etc/localtime:/etc/localtime:ro -v $VOL_HOSTDIR:$VOL_MOUNTPOINT $IMAGE /root/sd/${0##*/} _setup-all
+	;;
+
+    _build-image)
+        # build the Docker image
+	sudo chown -R `id -nu`:`id -ng` $IMAGE_TREE
+	cp ./Dockerfile $IMAGE_TREE
+	pushd .
+	cd $IMAGE_TREE
+	docker build -t f2hex/armhf-motioneye .
+	popd
+	;;
+
+    *)
+	# as default action performs the full build process
+	# build first the image content using a Container
+	./${0##*/} _build-content
+	# finally create the Docker image
+	./${0##*/} _build-image
+	;;
+esac
